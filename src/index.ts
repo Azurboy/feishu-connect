@@ -98,7 +98,7 @@ async function defaultHandler(request: Request, env: Env): Promise<Response> {
         cursor = page.cursor;
       } while (cursor);
       if (!allowed(env, pending.identity)) return new Response("Account no longer allowed", { status: 403 });
-      await vault.save({ ...pending.credentials, openId: pending.identity.open_id, tenantKey: pending.identity.tenant_key });
+      await vault.save({ ...pending.credentials, openId: pending.identity.open_id, tenantKey: pending.identity.tenant_key, generation: pending.generation });
       const { redirectTo } = await oauth.completeAuthorization({ request: pending.request, userId: session.user, metadata: {}, scope: pending.request.scope.filter((scope) => MCP_SCOPES.includes(scope)), props: { userId: session.user, displayName: pending.name } });
       for (const id of priorGrantIds) await vault.blockGrant(id);
       const headers = new Headers({ Location: redirectTo });

@@ -17,9 +17,9 @@ export type Env = {
   OAUTH_PROVIDER: unknown;
 };
 
-type Credentials = { access: string; refresh: string; accessExpires: number; refreshExpires: number; openId: string; tenantKey: string };
+type Credentials = { access: string; refresh: string; accessExpires: number; refreshExpires: number; openId: string; tenantKey: string; generation: number };
 type Stored = { iv: string; ciphertext: string };
-export type Pending = { credentials: Omit<Credentials, "openId" | "tenantKey">; identity: { open_id: string; tenant_key: string }; request: AuthRequest; name: string; expires: number };
+export type Pending = { credentials: Omit<Credentials, "openId" | "tenantKey" | "generation">; identity: { open_id: string; tenant_key: string }; request: AuthRequest; name: string; expires: number; generation: number };
 const toBytes = (value: string) => new TextEncoder().encode(value);
 const base64 = (value: Uint8Array) => btoa(String.fromCharCode(...value));
 const fromBase64 = (value: string) => Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
@@ -51,12 +51,17 @@ export class UserVault extends DurableObject<Env> {
   }
 
   private async write(value: Credentials): Promise<void> {
-    await this.ctx.storage.put("credentials", await this.seal(value));
+    const sealed = await this.seal(value);
+    await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get<number>("generation") ?? 0) !== value.generation) throw new Error("connection_revoked");
+      await txn.put("credentials", sealed);
+    });
     await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, value.accessExpires - 50_000));
   }
 
-  async savePending(handle: string, value: Pending): Promise<void> {
-    await this.ctx.storage.put(`pending:${handle}`, await this.seal(value));
+  async savePending(handle: string, value: Omit<Pending, "generation">): Promise<void> {
+    const generation = await this.ctx.storage.get<number>("generation") ?? 0;
+    await this.ctx.storage.put(`pending:${handle}`, await this.seal({ ...value, generation }));
     const prior = await this.ctx.storage.getAlarm();
     if (!prior || prior > value.expires) await this.ctx.storage.setAlarm(value.expires);
   }
@@ -142,10 +147,13 @@ export class UserVault extends DurableObject<Env> {
   }
 
   async clear(): Promise<void> {
-    await this.ctx.storage.delete("credentials");
-    await this.ctx.storage.delete("needs_reauth");
-    const pending = await this.ctx.storage.list({ prefix: "pending:" });
-    for (const key of pending.keys()) await this.ctx.storage.delete(key);
+    await this.ctx.storage.transaction(async (txn) => {
+      await txn.put("generation", (await txn.get<number>("generation") ?? 0) + 1);
+      await txn.delete("credentials");
+      await txn.delete("needs_reauth");
+      const pending = await txn.list({ prefix: "pending:" });
+      for (const key of pending.keys()) await txn.delete(key);
+    });
     await this.ctx.storage.deleteAlarm();
   }
 
