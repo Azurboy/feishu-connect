@@ -7,14 +7,13 @@ export class FeishuError extends Error {
 type Envelope<T> = { code?: number; data?: T };
 
 export class FeishuClient {
-  constructor(private readonly token: string, private readonly request: typeof fetch = fetch) {}
+  constructor(private readonly token: string, private readonly request: typeof fetch = fetch, private readonly deadline = Date.now() + 20_000) {}
 
   private async call<T>(path: string, body?: object): Promise<T> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new FeishuError("unsafe_api_path");
     const url = `${API}${path}`;
-    const deadline = Date.now() + 20_000;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const remaining = deadline - Date.now();
+      const remaining = this.deadline - Date.now();
       if (remaining <= 0) break;
       let response: Response;
       try {
@@ -26,11 +25,11 @@ export class FeishuClient {
           signal: AbortSignal.timeout(Math.min(6_000, remaining)),
         });
       } catch {
-        if (attempt < 2 && Date.now() < deadline) continue;
+        if (attempt < 2 && Date.now() < this.deadline) continue;
         throw new FeishuError("upstream_unavailable");
       }
-      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < 2 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(150 * (attempt + 1), Math.max(0, deadline - Date.now()))));
+      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < 2 && Date.now() < this.deadline) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(150 * (attempt + 1), Math.max(0, this.deadline - Date.now()))));
         continue;
       }
       if (response.status === 401) throw new FeishuError("needs_reauth");

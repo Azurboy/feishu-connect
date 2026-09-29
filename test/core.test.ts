@@ -121,6 +121,13 @@ describe("Feishu fixed API", () => {
     await expect(api.getDoc("doxcnSynthetic1234567890123")).rejects.toThrow("missing_scope");
     expect(calls).toEqual(["https://open.feishu.cn/open-apis/docx/v1/documents/doxcnSynthetic1234567890123"]);
   });
+
+  it("stops before an upstream request when the tool budget has expired", async () => {
+    const request = vi.fn();
+    const api = new FeishuClient("synthetic-token", request as typeof fetch, Date.now() - 1);
+    await expect(api.getDoc("doxcnSynthetic1234567890123")).rejects.toThrow("upstream_unavailable");
+    expect(request).not.toHaveBeenCalled();
+  });
 });
 
 describe("read-only tools", () => {
