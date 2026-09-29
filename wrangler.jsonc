@@ -1,0 +1,18 @@
+{
+  "name": "feishu-connect",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-29",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "f89a52118cf14da099b532c7b2b7dd1a" }],
+  "durable_objects": {
+    "bindings": [{ "name": "USERS", "class_name": "UserVault" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserVault"] }],
+  "vars": {
+    "APP_URL": "https://feishu-connect.example.workers.dev",
+    "FEISHU_BASE_URL": "https://example.feishu.cn",
+    "FEISHU_APP_ID": "REPLACE_WITH_APP_ID",
+    "ALLOWED_TENANTS": "REPLACE_WITH_TENANT_KEY",
+    "ALLOWED_USERS": "REPLACE_WITH_OPEN_IDS"
+  }
+}
