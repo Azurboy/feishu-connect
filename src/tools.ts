@@ -4,6 +4,10 @@ import { FeishuClient, type DocBlock } from "./feishu";
 
 export type ToolContext = { user: string; client: string; token: string; cursorSecret: string; feishuBaseUrl: string; request?: typeof fetch };
 const id = (value: string) => /^[A-Za-z0-9_-]{10,80}$/.test(value);
+const fingerprint = async (value: string) => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+  return btoa(String.fromCharCode(...digest.slice(0, 12))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
 
 function resource(input: string): { kind: "docx" | "wiki" | "doc"; token: string } {
   if (input.startsWith("https://")) {
@@ -33,12 +37,12 @@ export async function search(ctx: ToolContext, input: { query: string; kind?: "a
   const items: { id: string; title: string; url: string; kind: string; readable: boolean; hit_source: string; resource_key: string }[] = [];
   let nextCursor: string | null = null;
   let limitReached = false;
-  let allState = { d: 0, w: "", dd: false, wd: false };
+  let allState = { d: 0, w: "", dd: false, wd: false, seen: [] as string[] };
   if (kind === "all" && input.cursor) {
     const decoded = await readCursor(ctx.cursorSecret, input.cursor, { kind: "search-all", user: ctx.user, client: ctx.client, resource: query });
     try {
       const state = JSON.parse(String(decoded.position)) as typeof allState;
-      if (!Number.isSafeInteger(state.d) || state.d < 0 || typeof state.w !== "string" || typeof state.dd !== "boolean" || typeof state.wd !== "boolean") throw Error();
+      if (!Number.isSafeInteger(state.d) || state.d < 0 || typeof state.w !== "string" || typeof state.dd !== "boolean" || typeof state.wd !== "boolean" || !Array.isArray(state.seen) || state.seen.length > 400 || !state.seen.every((item) => typeof item === "string" && /^[\w-]{16}$/.test(item))) throw Error();
       allState = state;
     } catch { throw new Error("invalid_cursor"); }
   }
@@ -62,19 +66,27 @@ export async function search(ctx: ToolContext, input: { query: string; kind?: "a
   }
   if ((kind === "wiki" || kind === "all") && (kind !== "all" || !allState.wd)) {
     const page = kind === "all" ? allState.w || undefined : input.cursor ? String((await readCursor(ctx.cursorSecret, input.cursor, { kind: "search-wiki", user: ctx.user, client: ctx.client, resource: `${query}:${input.space_id ?? ""}` })).position) : undefined;
-    const data = await api.searchWiki(query, input.space_id, page);
+    const data = await api.searchWiki(query, input.space_id, page, kind === "all" ? 10 : 20);
     for (const item of data.items ?? []) {
       if (!id(item.node_id)) continue;
-      items.push({ id: `wiki:${item.node_id}`, title: item.title, url: item.url, kind: "wiki", readable: item.obj_type === 8, hit_source: "provider_keyword", resource_key: item.obj_token });
+      items.push({ id: `wiki:${item.node_id}`, title: item.title, url: sourceUrl(ctx, "wiki", item.node_id), kind: "wiki", readable: item.obj_type === 8, hit_source: "provider_keyword", resource_key: item.obj_token });
     }
     if (data.has_more && !data.page_token) throw new Error("incomplete_search_page");
     if (data.has_more && data.page_token && kind === "wiki") nextCursor = await signCursor(ctx.cursorSecret, { kind: "search-wiki", user: ctx.user, client: ctx.client, resource: `${query}:${input.space_id ?? ""}`, position: data.page_token });
     if (kind === "all") { allState.w = data.page_token ?? ""; allState.wd = !data.has_more; }
   }
-  if (kind === "all" && (!allState.dd || !allState.wd)) nextCursor = await signCursor(ctx.cursorSecret, { kind: "search-all", user: ctx.user, client: ctx.client, resource: query, position: JSON.stringify(allState) });
+  const needsAllCursor = kind === "all" && (!allState.dd || !allState.wd);
   const unique = new Map<string, typeof items[number]>();
   for (const item of items) unique.set(item.resource_key, item.kind === "wiki" || !unique.has(item.resource_key) ? item : unique.get(item.resource_key)!);
-  return { items: [...unique.values()].slice(0, 20).map(({ resource_key: _key, ...item }) => item), search_mode: "provider_keyword", next_cursor: nextCursor, limit_reached: limitReached, scope: input.space_id ? "wiki_space" : "visible_resources" };
+  const visible: typeof items = [];
+  for (const item of unique.values()) {
+    const key = await fingerprint(item.resource_key);
+    if (kind !== "all" || !allState.seen.includes(key)) visible.push(item);
+    if (kind === "all") allState.seen.push(key);
+  }
+  if (kind === "all" && allState.seen.length >= 400) limitReached = true;
+  else if (needsAllCursor) nextCursor = await signCursor(ctx.cursorSecret, { kind: "search-all", user: ctx.user, client: ctx.client, resource: query, position: JSON.stringify(allState) });
+  return { items: visible.map(({ resource_key: _key, ...item }) => item), search_mode: "provider_keyword", next_cursor: nextCursor, limit_reached: limitReached, scope: input.space_id ? "wiki_space" : "visible_resources" };
 }
 
 export async function listWiki(ctx: ToolContext, input: { space_id?: string; node_id?: string; cursor?: string }) {
@@ -116,9 +128,10 @@ export async function fetchDoc(ctx: ToolContext, input: { id: string; cursor?: s
   const after = (await api.getDoc(documentId)).document;
   if (before.revision_id !== after.revision_id) throw new Error("source_changed");
   const rendered = renderBlocks(blocks);
+  const characters = Array.from(rendered.content);
   const position = cursor ? Number(cursor.position) : 0;
-  if (!Number.isSafeInteger(position) || position < 0 || position > rendered.content.length) throw new Error("invalid_cursor");
-  const end = Math.min(position + 12_000, rendered.content.length);
-  const hasMore = end < rendered.content.length;
-  return { id: input.id, title: before.title, url: sourceUrl(ctx, source.kind, source.token), revision: before.revision_id, fetched_at: new Date().toISOString(), source_updated_at: null, content: rendered.content.slice(position, end), has_more: hasMore, next_cursor: hasMore ? await signCursor(ctx.cursorSecret, { kind: "fetch", user: ctx.user, client: ctx.client, resource: `${source.kind}:${source.token}`, position: end, revision: before.revision_id }) : null, omissions: rendered.omissions };
+  if (!Number.isSafeInteger(position) || position < 0 || position > characters.length) throw new Error("invalid_cursor");
+  const end = Math.min(position + 12_000, characters.length);
+  const hasMore = end < characters.length;
+  return { id: input.id, title: before.title, url: sourceUrl(ctx, source.kind, source.token), revision: before.revision_id, fetched_at: new Date().toISOString(), source_updated_at: null, content: characters.slice(position, end).join(""), has_more: hasMore, next_cursor: hasMore ? await signCursor(ctx.cursorSecret, { kind: "fetch", user: ctx.user, client: ctx.client, resource: `${source.kind}:${source.token}`, position: end, revision: before.revision_id }) : null, omissions: rendered.omissions };
 }

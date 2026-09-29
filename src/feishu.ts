@@ -12,7 +12,10 @@ export class FeishuClient {
   private async call<T>(path: string, body?: object): Promise<T> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new FeishuError("unsafe_api_path");
     const url = `${API}${path}`;
+    const deadline = Date.now() + 20_000;
     for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       let response: Response;
       try {
         response = await this.request(url, {
@@ -20,13 +23,16 @@ export class FeishuClient {
           headers: { Authorization: `Bearer ${this.token}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
           body: body === undefined ? undefined : JSON.stringify(body),
           redirect: "error",
-          signal: AbortSignal.timeout(7_000),
+          signal: AbortSignal.timeout(Math.min(6_000, remaining)),
         });
       } catch {
-        if (attempt < 2) continue;
+        if (attempt < 2 && Date.now() < deadline) continue;
         throw new FeishuError("upstream_unavailable");
       }
-      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < 2) continue;
+      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(150 * (attempt + 1), Math.max(0, deadline - Date.now()))));
+        continue;
+      }
       if (response.status === 401) throw new FeishuError("needs_reauth");
       if (response.status === 403 || response.status === 404) throw new FeishuError("access_denied");
       if (!response.ok) throw new FeishuError("upstream_unavailable");
@@ -46,8 +52,8 @@ export class FeishuClient {
     return this.call("/suite/docs-api/search/object", { search_key: query, count, offset });
   }
 
-  searchWiki(query: string, spaceId?: string, pageToken?: string): Promise<{ items: WikiSearchItem[]; has_more: boolean; page_token?: string }> {
-    const params = new URLSearchParams({ page_size: "20" });
+  searchWiki(query: string, spaceId?: string, pageToken?: string, count = 20): Promise<{ items: WikiSearchItem[]; has_more: boolean; page_token?: string }> {
+    const params = new URLSearchParams({ page_size: String(count) });
     if (pageToken) params.set("page_token", pageToken);
     return this.call(`/wiki/v2/nodes/search?${params}`, { query, ...(spaceId ? { space_id: spaceId } : {}) });
   }

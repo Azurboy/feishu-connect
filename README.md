@@ -4,7 +4,7 @@
 
 Read-only Feishu Docs and Wiki access for cloud AI agents through a hosted, OAuth-protected MCP server. Your agent searches and reads original sources; Feishu Connect does not run a model, summarize documents, or build a copy of your knowledge base.
 
-> **Development preview, not yet a hosted service.** The read-only core and OAuth server compile; local synthetic tests pass. Feishu app authorization, deployment, real account isolation, ChatGPT/Manus calls, and multi-day operation still require verification. Do not enter company credentials into an unverified deployment.
+> **Development preview, not yet a hosted service.** The read-only core, browser consent, and connection manager have local synthetic tests. A dedicated Feishu app, real account isolation, ChatGPT/Manus calls, and multi-day operation still require verification. Do not enter company credentials into an unverified deployment.
 
 ## Why this exists
 
@@ -50,7 +50,7 @@ flowchart LR
     B --> E[Per-user encrypted token vault]
 ```
 
-The OAuth provider validates the client, redirect URI, PKCE, token audience, and grant. The Worker checks scope and current connection state on every MCP request. A per-user Durable Object holds encrypted Feishu credentials and serializes refresh. User content is fetched on demand and not indexed or persisted by this code. Cursor signatures bind a continuation to the user, client, resource, and revision.
+The OAuth provider validates the client, redirect URI, PKCE, token audience, and grant. The Worker checks scope, current allowlists, revocation, and connection state on every MCP request. A per-user Durable Object holds encrypted Feishu credentials and serializes refresh. User content is fetched on demand and not indexed or persisted by this code. Cursor signatures bind a continuation to the user, client, resource, and revision. Users can review and revoke individual grants at `/connections`; revoking a grant does not remove material already sent to an agent.
 
 ## Develop locally
 
@@ -65,11 +65,17 @@ npm test
 npx wrangler deploy --dry-run
 ```
 
-The checked-in `wrangler.jsonc` contains placeholders and cannot serve real users. Deployment requires a dedicated Feishu self-built app with a redirect URL ending `/callback`, these **user** scopes: `search:docs:read`, `docx:document:readonly`, `wiki:wiki:readonly`, `offline_access`; a Cloudflare KV namespace; a service URL; the tenant's Feishu base URL; explicit tenant and user allowlists; and Worker secrets `FEISHU_APP_SECRET`, `CURSOR_SECRET`, `VAULT_KEY`. Keep all secret values out of Git. Do not reuse another project's Feishu App Secret or a local CLI token.
+The checked-in `wrangler.jsonc` contains placeholders and cannot serve real users. To deploy an organization-owned instance:
+
+1. Create a dedicated Feishu self-built app. Enable browser OAuth and these **user** scopes: `search:docs:read`, `docx:document:readonly`, `wiki:wiki:readonly`, `offline_access`. Restrict the app's availability to invited members and publish its required version inside the tenant.
+2. Choose a HTTPS Worker URL. Register exactly `https://YOUR-WORKER/callback` and `https://YOUR-WORKER/manage/callback` as Feishu redirect URLs. Set `APP_URL` to the same origin with a trailing `/`.
+3. Create a Cloudflare KV namespace and put its ID in `wrangler.jsonc`. Set `FEISHU_APP_ID`, `FEISHU_BASE_URL`, `ALLOWED_TENANTS` (tenant keys), and `ALLOWED_USERS` (open IDs). Keep the allowlists small for 2A. The repository's checked-in namespace ID belongs to the maintainer's development account; replace it for an independent deployment.
+4. Put `FEISHU_APP_SECRET`, `CURSOR_SECRET`, `SESSION_SECRET`, and a 32-byte base64 `VAULT_KEY` into Worker secrets with `npx wrangler secret put NAME`. Generate each signing secret independently with at least 32 random bytes. Never commit secret values or put them in URL query parameters.
+5. Deploy with `npx wrangler deploy`. Open `/connections` to confirm Feishu login, then add `https://YOUR-WORKER/mcp` in a remote MCP client that actually exposes custom servers. Complete the client's OAuth flow and test `connection_status`, `search`, `fetch`, `list_wiki`, and independent revocation.
 
 `FEISHU_BASE_URL` is the organization's real `https://…feishu.cn/` document origin. The service never fetches a URL supplied to `fetch`: it parses an allowed Feishu document URL, then calls fixed official OpenAPI endpoints with that user's UAT. Read access still depends on both app grants and the user's resource permissions.
 
-Current deployment instructions are intentionally incomplete until Feishu OAuth, refresh, revocation, and real client calls pass the [specification](docs/SPEC_v0.1.md). The service is restricted to one configured tenant and invited users in this phase. Cross-enterprise self-service requires Feishu app distribution and separate platform review.
+These are self-hosting steps, not a claim of a verified hosted service. The service is restricted to configured tenants and invited users in this phase. Cross-enterprise self-service requires Feishu app distribution and separate platform review. Follow the [acceptance status](docs/ACCEPTANCE_STATUS.md) before using it with real company content.
 
 ## Privacy and safety
 

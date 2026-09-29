@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
+import { allowed } from "./upstream";
 
 export type Env = {
   OAUTH_KV: KVNamespace;
@@ -10,12 +12,14 @@ export type Env = {
   ALLOWED_TENANTS: string;
   ALLOWED_USERS: string;
   CURSOR_SECRET: string;
+  SESSION_SECRET: string;
   VAULT_KEY: string;
   OAUTH_PROVIDER: unknown;
 };
 
-type Credentials = { access: string; refresh: string; accessExpires: number; refreshExpires: number };
+type Credentials = { access: string; refresh: string; accessExpires: number; refreshExpires: number; openId: string; tenantKey: string };
 type Stored = { iv: string; ciphertext: string };
+export type Pending = { credentials: Omit<Credentials, "openId" | "tenantKey">; identity: { open_id: string; tenant_key: string }; request: AuthRequest; name: string; expires: number };
 const toBytes = (value: string) => new TextEncoder().encode(value);
 const base64 = (value: Uint8Array) => btoa(String.fromCharCode(...value));
 const fromBase64 = (value: string) => Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
@@ -32,15 +36,40 @@ export class UserVault extends DurableObject<Env> {
   private async read(): Promise<Credentials | null> {
     const saved = await this.ctx.storage.get<Stored>("credentials");
     if (!saved) return null;
+    return this.unseal<Credentials>(saved);
+  }
+
+  private async seal(value: unknown): Promise<Stored> {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await this.key(), toBytes(JSON.stringify(value)));
+    return { iv: base64(iv), ciphertext: base64(new Uint8Array(encrypted)) };
+  }
+
+  private async unseal<T>(saved: Stored): Promise<T> {
     const decoded = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromBase64(saved.iv) }, await this.key(), fromBase64(saved.ciphertext));
-    return JSON.parse(new TextDecoder().decode(decoded)) as Credentials;
+    return JSON.parse(new TextDecoder().decode(decoded)) as T;
   }
 
   private async write(value: Credentials): Promise<void> {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await this.key(), toBytes(JSON.stringify(value)));
-    await this.ctx.storage.put("credentials", { iv: base64(iv), ciphertext: base64(new Uint8Array(encrypted)) });
+    await this.ctx.storage.put("credentials", await this.seal(value));
     await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, value.accessExpires - 50_000));
+  }
+
+  async savePending(handle: string, value: Pending): Promise<void> {
+    await this.ctx.storage.put(`pending:${handle}`, await this.seal(value));
+    const prior = await this.ctx.storage.getAlarm();
+    if (!prior || prior > value.expires) await this.ctx.storage.setAlarm(value.expires);
+  }
+
+  async consumePending(handle: string): Promise<Pending | null> {
+    const saved = await this.ctx.storage.transaction(async (txn) => {
+      const value = await txn.get<Stored>(`pending:${handle}`);
+      if (value) await txn.delete(`pending:${handle}`);
+      return value;
+    });
+    if (!saved) return null;
+    const value = await this.unseal<Pending>(saved);
+    return value.expires > Date.now() ? value : null;
   }
 
   async save(value: Credentials): Promise<void> {
@@ -52,12 +81,29 @@ export class UserVault extends DurableObject<Env> {
   async status(): Promise<"connected" | "needs_reauth" | "disconnected"> {
     if (await this.ctx.storage.get("needs_reauth")) return "needs_reauth";
     const value = await this.read();
-    return value && value.refreshExpires > Date.now() ? "connected" : "disconnected";
+    return value && value.refreshExpires > Date.now() && allowed(this.env, { open_id: value.openId, tenant_key: value.tenantKey }) ? "connected" : "disconnected";
+  }
+
+  async markUsed(clientId: string): Promise<void> {
+    if (clientId) await this.ctx.storage.put(`used:${clientId}`, Date.now());
+  }
+
+  async lastUsed(clientId: string): Promise<number | null> {
+    return await this.ctx.storage.get<number>(`used:${clientId}`) ?? null;
+  }
+
+  async blockGrant(grantId: string): Promise<void> {
+    await this.ctx.storage.put(`blocked:${grantId}`, true);
+  }
+
+  async isBlocked(grantId: string): Promise<boolean> {
+    return !!await this.ctx.storage.get(`blocked:${grantId}`);
   }
 
   async accessToken(): Promise<string> {
     const value = await this.read();
     if (!value || await this.ctx.storage.get("needs_reauth")) throw new Error("needs_reauth");
+    if (!allowed(this.env, { open_id: value.openId, tenant_key: value.tenantKey })) throw new Error("access_denied");
     if (value.accessExpires > Date.now() + 60_000) return value.access;
     this.refreshing ??= this.refresh(value).finally(() => { this.refreshing = undefined; });
     return this.refreshing;
@@ -78,10 +124,10 @@ export class UserVault extends DurableObject<Env> {
         signal: AbortSignal.timeout(7_000),
       });
     } catch {
-      await this.ctx.storage.put("needs_reauth", true);
-      throw new Error("needs_reauth");
+      throw new Error("upstream_unavailable");
     }
     if (!response.ok) {
+      if (response.status === 429 || response.status >= 500) throw new Error("upstream_unavailable");
       await this.ctx.storage.put("needs_reauth", true);
       throw new Error("needs_reauth");
     }
@@ -91,16 +137,32 @@ export class UserVault extends DurableObject<Env> {
       throw new Error("needs_reauth");
     }
     const now = Date.now();
-    await this.write({ access: data.access_token, refresh: data.refresh_token, accessExpires: now + data.expires_in * 1000, refreshExpires: now + data.refresh_token_expires_in * 1000 });
+    await this.write({ ...value, access: data.access_token, refresh: data.refresh_token, accessExpires: now + data.expires_in * 1000, refreshExpires: now + data.refresh_token_expires_in * 1000 });
     return data.access_token;
   }
 
   async clear(): Promise<void> {
-    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.delete("credentials");
+    await this.ctx.storage.delete("needs_reauth");
+    const pending = await this.ctx.storage.list({ prefix: "pending:" });
+    for (const key of pending.keys()) await this.ctx.storage.delete(key);
+    await this.ctx.storage.deleteAlarm();
   }
 
   async alarm(): Promise<void> {
-    try { await this.accessToken(); } catch { /* status records the need to reconnect */ }
+    const pending = await this.ctx.storage.list<Stored>({ prefix: "pending:" });
+    let next = Infinity;
+    for (const [key, saved] of pending) {
+      const value = await this.unseal<Pending>(saved);
+      if (value.expires <= Date.now()) await this.ctx.storage.delete(key);
+      else next = Math.min(next, value.expires);
+    }
+    try { await this.accessToken(); } catch (error) {
+      if (error instanceof Error && error.message === "upstream_unavailable") next = Math.min(next, Date.now() + 60_000);
+    }
+    const current = await this.read();
+    if (current && !await this.ctx.storage.get("needs_reauth") && current.accessExpires > Date.now() + 50_000) next = Math.min(next, current.accessExpires - 50_000);
+    if (Number.isFinite(next)) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, next));
   }
 }
 
